@@ -9,11 +9,16 @@ use std::sync::Arc;
 use std::thread;
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2, ViewportCommand};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND};
 use windows_sys::Win32::System::Threading::{
     CreateEventA, CreateMutexA, SetEvent, WaitForSingleObject, INFINITE,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE,
 };
 
 use bluetooth::BudsClient;
@@ -152,6 +157,7 @@ fn build_tray() -> (TrayIcon, TrayMenuIds) {
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
         .with_tooltip("Pods4 — Passthrough & Noise Controls")
         .with_icon(make_dot_icon(0x64, 0x74, 0x8B))
         .build()
@@ -160,13 +166,47 @@ fn build_tray() -> (TrayIcon, TrayMenuIds) {
     (tray, ids)
 }
 
+fn show_hwnd(hwnd: isize, ctx: &egui::Context) {
+    if hwnd == 0 {
+        return;
+    }
+    let h = hwnd as HWND;
+    unsafe {
+        ShowWindow(h, SW_SHOW);
+        if IsIconic(h) != 0 {
+            ShowWindow(h, SW_RESTORE);
+        }
+        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        SetForegroundWindow(h);
+    }
+    ctx.request_repaint();
+}
+
+fn hide_hwnd(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_HIDE);
+    }
+}
+
+fn is_hwnd_showing(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let h = hwnd as HWND;
+    unsafe { IsWindowVisible(h) != 0 && IsIconic(h) == 0 }
+}
+
 struct Pods4App {
     client: BudsClient,
     ui_state: BudsState,
     last_mode: NoiseControlMode,
     tray: TrayIcon,
+    hwnd: isize,
     exiting: Arc<AtomicBool>,
-    visible: Arc<AtomicBool>,
 }
 
 impl Pods4App {
@@ -175,6 +215,15 @@ impl Pods4App {
         client: BudsClient,
         show_event: HANDLE,
     ) -> Self {
+        let hwnd: isize = cc
+            .window_handle()
+            .ok()
+            .and_then(|h| match h.as_raw() {
+                RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+                _ => None,
+            })
+            .unwrap_or(0);
+
         // Dark theme styling
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BG_MAIN;
@@ -187,35 +236,28 @@ impl Pods4App {
 
         let (tray, menu_ids) = build_tray();
         let exiting = Arc::new(AtomicBool::new(false));
-        let visible = Arc::new(AtomicBool::new(true));
 
         // Repaint UI whenever Bluetooth state changes
         let ctx_bt = cc.egui_ctx.clone();
         client.set_on_update(Arc::new(move || ctx_bt.request_repaint()));
 
-        // Watch second-instance wake signal
+        // Watch second-instance wake signal (directly calls Win32 ShowWindow so it works while hidden)
         let ctx_wake = cc.egui_ctx.clone();
-        let vis_wake = visible.clone();
         let client_wake = client.clone();
         let show_event_addr = show_event as usize;
         thread::spawn(move || {
             let h = show_event_addr as HANDLE;
             loop {
                 unsafe { WaitForSingleObject(h, INFINITE); }
-                vis_wake.store(true, Ordering::SeqCst);
-                ctx_wake.send_viewport_cmd(ViewportCommand::Visible(true));
-                ctx_wake.send_viewport_cmd(ViewportCommand::Minimized(false));
-                ctx_wake.send_viewport_cmd(ViewportCommand::Focus);
-                ctx_wake.request_repaint();
+                show_hwnd(hwnd, &ctx_wake);
                 if !client_wake.is_connected() {
                     client_wake.connect_auto_async();
                 }
             }
         });
 
-        // Watch tray clicks & menu actions (works even when main window is hidden!)
+        // Watch tray clicks & menu actions (works reliably even when main window is hidden)
         let ctx_tray = cc.egui_ctx.clone();
-        let vis_tray = visible.clone();
         let exit_tray = exiting.clone();
         let client_tray = client.clone();
         thread::spawn(move || loop {
@@ -228,29 +270,24 @@ impl Pods4App {
                     ..
                 } = ev
                 {
-                    let now_vis = !vis_tray.load(Ordering::SeqCst);
-                    vis_tray.store(now_vis, Ordering::SeqCst);
-                    ctx_tray.send_viewport_cmd(ViewportCommand::Visible(now_vis));
-                    if now_vis {
-                        ctx_tray.send_viewport_cmd(ViewportCommand::Focus);
+                    if is_hwnd_showing(hwnd) {
+                        hide_hwnd(hwnd);
+                    } else {
+                        show_hwnd(hwnd, &ctx_tray);
                         if !client_tray.is_connected() {
                             client_tray.connect_auto_async();
                         }
                     }
-                    ctx_tray.request_repaint();
                 }
             }
 
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 handled = true;
                 if ev.id == menu_ids.show {
-                    vis_tray.store(true, Ordering::SeqCst);
-                    ctx_tray.send_viewport_cmd(ViewportCommand::Visible(true));
-                    ctx_tray.send_viewport_cmd(ViewportCommand::Focus);
+                    show_hwnd(hwnd, &ctx_tray);
                     if !client_tray.is_connected() {
                         client_tray.connect_auto_async();
                     }
-                    ctx_tray.request_repaint();
                 } else if ev.id == menu_ids.ambient {
                     client_tray.send_async(set_noise_control(NoiseControlMode::Ambient));
                 } else if ev.id == menu_ids.anc {
@@ -264,7 +301,9 @@ impl Pods4App {
                 } else if ev.id == menu_ids.exit {
                     exit_tray.store(true, Ordering::SeqCst);
                     client_tray.disconnect();
-                    ctx_tray.send_viewport_cmd(ViewportCommand::Visible(true));
+                    if hwnd != 0 {
+                        unsafe { PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0); }
+                    }
                     ctx_tray.send_viewport_cmd(ViewportCommand::Close);
                     ctx_tray.request_repaint();
                     return;
@@ -281,8 +320,8 @@ impl Pods4App {
             ui_state: BudsState::default(),
             last_mode: NoiseControlMode::Off,
             tray,
+            hwnd,
             exiting,
-            visible,
         }
     }
 }
@@ -292,8 +331,7 @@ impl eframe::App for Pods4App {
         // Intercept window X button -> hide to system tray instead of exiting
         if ctx.input(|i| i.viewport().close_requested()) && !self.exiting.load(Ordering::SeqCst) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            self.visible.store(false, Ordering::SeqCst);
+            hide_hwnd(self.hwnd);
             return;
         }
 

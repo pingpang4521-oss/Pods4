@@ -1973,6 +1973,7 @@ name = "pods4"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "raw-window-handle",
  "tray-icon",
  "windows-sys 0.59.0",
 ]
