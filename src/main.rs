@@ -3,29 +3,38 @@
 mod bluetooth;
 mod protocol;
 
-use std::ptr::null;
+use std::ffi::c_void;
+use std::mem::{size_of, zeroed};
+use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2, ViewportCommand};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HWND,
+};
+use windows_sys::Win32::System::Registry::{RegGetValueA, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
 use windows_sys::Win32::System::Threading::{
     CreateEventA, CreateMutexA, SetEvent, WaitForSingleObject, INFINITE,
 };
+use windows_sys::Win32::UI::Shell::{
+    ShellExecuteExW, ShellExecuteW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNORMAL, WM_CLOSE,
 };
 
 use bluetooth::BudsClient;
 use protocol::{
     set_ambient_during_calls, set_ambient_volume, set_anc_level, set_customize_ambient,
-    set_noise_control, set_one_earbud_noise_control, set_siren_detect, set_voice_detect,
-    set_voice_detect_duration, BudsState, NoiseControlMode, PlacementState,
+    set_gaming_mode, set_noise_control, set_one_earbud_noise_control, set_siren_detect,
+    set_voice_detect, set_voice_detect_duration, BudsState, NoiseControlMode, PlacementState,
 };
 
 const MUTEX_NAME: &[u8] = b"Local\\Pods4_SingleInstance\0";
@@ -200,10 +209,114 @@ fn is_hwnd_showing(hwnd: isize) -> bool {
     unsafe { IsWindowVisible(h) != 0 && IsIconic(h) == 0 }
 }
 
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Returns true when Windows Bluetooth A2DP AAC is disabled (forcing lower-latency SBC).
+fn read_sbc_forced() -> bool {
+    let mut val: u32 = 1;
+    let mut size: u32 = size_of::<u32>() as u32;
+    let rc = unsafe {
+        RegGetValueA(
+            HKEY_LOCAL_MACHINE,
+            b"SYSTEM\\CurrentControlSet\\Services\\BthA2dp\\Parameters\0".as_ptr(),
+            b"BluetoothAacEnable\0".as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&mut val as *mut u32).cast::<c_void>(),
+            &mut size,
+        )
+    };
+    rc == ERROR_SUCCESS && val == 0
+}
+
+fn open_sound_settings() {
+    let verb = wide("open");
+    let uri = wide("ms-settings:sound");
+    unsafe {
+        ShellExecuteW(null_mut(), verb.as_ptr(), uri.as_ptr(), null(), null(), SW_SHOWNORMAL);
+    }
+}
+
+struct CodecState {
+    force_sbc: bool,
+    busy: bool,
+    note: String,
+}
+
+fn apply_sbc_forced_async(
+    force_sbc: bool,
+    codec: Arc<Mutex<CodecState>>,
+    client: BudsClient,
+    ctx: egui::Context,
+) {
+    {
+        let mut st = codec.lock().unwrap();
+        if st.busy {
+            return;
+        }
+        st.busy = true;
+        st.note = "Waiting for Windows admin permission...".into();
+    }
+    ctx.request_repaint();
+
+    thread::spawn(move || {
+        let aac_val = if force_sbc { 0 } else { 1 };
+        let cmd = format!(
+            "/c reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\BthA2dp\\Parameters\" /v BluetoothAacEnable /t REG_DWORD /d {aac_val} /f && pnputil /restart-device /deviceid \"BTHENUM\\{{0000110b-0000-1000-8000-00805f9b34fb}}\""
+        );
+        let verb = wide("runas");
+        let file = wide("cmd.exe");
+        let params = wide(&cmd);
+
+        let mut sei: SHELLEXECUTEINFOW = unsafe { zeroed() };
+        sei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb = verb.as_ptr();
+        sei.lpFile = file.as_ptr();
+        sei.lpParameters = params.as_ptr();
+        sei.nShow = SW_HIDE;
+
+        let ok = unsafe { ShellExecuteExW(&mut sei) != 0 };
+        if ok && !sei.hProcess.is_null() {
+            unsafe {
+                WaitForSingleObject(sei.hProcess, INFINITE);
+                CloseHandle(sei.hProcess);
+            }
+        }
+
+        let actual = read_sbc_forced();
+        {
+            let mut st = codec.lock().unwrap();
+            st.force_sbc = actual;
+            st.busy = false;
+            st.note = if !ok {
+                "Permission canceled — codec unchanged.".into()
+            } else if actual == force_sbc {
+                if actual {
+                    "SBC active (A2DP restarted). Reboot PC once if delay doesn't drop.".into()
+                } else {
+                    "AAC restored (A2DP restarted).".into()
+                }
+            } else {
+                "Registry update failed — try running as administrator.".into()
+            };
+        }
+        ctx.request_repaint();
+
+        if ok {
+            thread::sleep(std::time::Duration::from_millis(800));
+            client.connect_auto_async();
+        }
+    });
+}
+
 struct Pods4App {
     client: BudsClient,
     ui_state: BudsState,
     last_mode: NoiseControlMode,
+    codec: Arc<Mutex<CodecState>>,
     tray: TrayIcon,
     hwnd: isize,
     exiting: Arc<AtomicBool>,
@@ -319,6 +432,11 @@ impl Pods4App {
             client,
             ui_state: BudsState::default(),
             last_mode: NoiseControlMode::Off,
+            codec: Arc::new(Mutex::new(CodecState {
+                force_sbc: read_sbc_forced(),
+                busy: false,
+                note: String::new(),
+            })),
             tray,
             hwnd,
             exiting,
@@ -555,6 +673,61 @@ impl eframe::App for Pods4App {
                             if toggle_row(ui, "Noise Controls with One Earbud", "Allow ANC & Adaptive while wearing only one bud", &mut one_bud) {
                                 self.client.send_async(set_one_earbud_noise_control(one_bud));
                             }
+                        });
+                    });
+
+                    // 6. Low Latency & Codec Card (Windows SBC toggle works even while disconnected)
+                    card(ui, |ui| {
+                        section_title(ui, "LOW LATENCY & SYNC");
+
+                        let (mut force_sbc, busy, note) = {
+                            let c = self.codec.lock().unwrap();
+                            (c.force_sbc, c.busy, c.note.clone())
+                        };
+                        ui.add_enabled_ui(!busy, |ui| {
+                            if toggle_row(
+                                ui,
+                                "Force SBC Codec (Disable AAC)",
+                                "Cuts Windows Bluetooth lag (~100–150 ms); asks admin once",
+                                &mut force_sbc,
+                            ) {
+                                apply_sbc_forced_async(
+                                    force_sbc,
+                                    self.codec.clone(),
+                                    self.client.clone(),
+                                    ctx.clone(),
+                                );
+                            }
+                        });
+                        if !note.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(note).size(11.0).color(ACCENT_AMBER));
+                        }
+
+                        ui.add_space(8.0);
+                        ui.add_enabled_ui(snap.connected, |ui| {
+                            let mut gm = self.ui_state.gaming_mode;
+                            if toggle_row(
+                                ui,
+                                "Earbud Gaming Mode",
+                                "Samsung low-latency sync flag (small effect on Windows)",
+                                &mut gm,
+                            ) {
+                                self.client.send_async(set_gaming_mode(gm));
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Audio Output & Enhancements").size(13.0).color(Color32::from_rgb(0xF1, 0xF5, 0xF9)));
+                                ui.label(RichText::new("Bypass Voicemeeter & turn Enhancements Off").size(11.0).color(TEXT_MUTED));
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Sound Settings").clicked() {
+                                    open_sound_settings();
+                                }
+                            });
                         });
                     });
                 });

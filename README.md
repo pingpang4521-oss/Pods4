@@ -12,6 +12,7 @@ Lightweight standalone **Rust** Windows desktop & system-tray controller for **S
   - **Siren Detect** (auto-switch to Ambient Sound on alarms & sirens)
   - **Ambient Sound During Calls** (sidetone)
   - **Noise Controls with One Earbud**
+- **Low Latency & Sync**: One-click Windows Bluetooth **Force SBC Codec (Disable AAC)** toggle (with UAC & A2DP restart), **Earbud Gaming Mode** (`ADJUST_SOUND_SYNC`), and quick access to Windows Sound Settings.
 - **Live Status & Single-Instance System Tray**: Battery & wear/charging badges for Left, Right, and Case; closing minimizes to tray and relaunching wakes the connected window without duplicating Bluetooth connections.
 - **Single Standalone `.exe`**: Pure Rust (`eframe`/`egui` + `tray-icon` + native Win32 `ws2_32.dll` & `bthprops.cpl`) — no runtime dependencies required to run.
 

@@ -86,6 +86,7 @@ pub mod msg_id {
     pub const CUSTOMIZE_AMBIENT_SOUND: u8 = 0x82;    // 130
     pub const NOISE_REDUCTION_LEVEL: u8 = 0x83;      // 131
     pub const AMBIENT_VOLUME: u8 = 0x84;             // 132
+    pub const ADJUST_SOUND_SYNC: u8 = 0x85;          // 133 (Gaming Mode / low-latency sync)
     pub const SET_SIDETONE: u8 = 0x8B;               // 139
     pub const SIREN_DETECT: u8 = 0xDE;               // 222
 }
@@ -112,6 +113,7 @@ pub struct BudsState {
     pub siren_detect: bool,
     pub ambient_during_calls: bool,
     pub one_earbud_noise_control: bool,
+    pub gaming_mode: bool,
 
     pub battery_l: u8,
     pub battery_r: u8,
@@ -139,6 +141,7 @@ impl Default for BudsState {
             siren_detect: false,
             ambient_during_calls: false,
             one_earbud_noise_control: false,
+            gaming_mode: false,
             battery_l: 0,
             battery_r: 0,
             battery_case: 0,
@@ -226,6 +229,10 @@ pub fn set_one_earbud_noise_control(on: bool) -> Vec<u8> {
     encode(msg_id::SET_ANC_WITH_ONE_EARBUD, &[u8::from(on)])
 }
 
+pub fn set_gaming_mode(on: bool) -> Vec<u8> {
+    encode(msg_id::ADJUST_SOUND_SYNC, &[u8::from(on)])
+}
+
 pub fn set_customize_ambient(on: bool, left: u8, right: u8, tone: u8) -> Vec<u8> {
     encode(
         msg_id::CUSTOMIZE_AMBIENT_SOUND,
@@ -287,6 +294,7 @@ pub fn apply_packet(state: &mut BudsState, pkt: &SppPacket) -> bool {
             state.placement_l = PlacementState::from_byte((p[6] & 0xF0) >> 4);
             state.placement_r = PlacementState::from_byte(p[6] & 0x0F);
             state.battery_case = p[7];
+            state.gaming_mode = p[8] == 1;
             state.mode = NoiseControlMode::from_byte(p[12]).unwrap_or(NoiseControlMode::Off);
             state.ambient_volume = p[23].min(4);
             state.anc_level = p[24].min(4);
@@ -358,6 +366,7 @@ pub fn apply_packet(state: &mut BudsState, pkt: &SppPacket) -> bool {
                 msg_id::SIREN_DETECT => { state.siren_detect = val == 1; true }
                 msg_id::SET_SIDETONE => { state.ambient_during_calls = val == 1; true }
                 msg_id::SET_ANC_WITH_ONE_EARBUD => { state.one_earbud_noise_control = val == 1; true }
+                msg_id::ADJUST_SOUND_SYNC => { state.gaming_mode = val == 1; true }
                 msg_id::CUSTOMIZE_AMBIENT_SOUND if p.len() >= 5 => {
                     state.custom_ambient_on = p[1] == 1;
                     state.custom_ambient_left = p[2].min(2);
@@ -431,6 +440,7 @@ mod tests {
             set_siren_detect(true),
             set_ambient_during_calls(true),
             set_one_earbud_noise_control(true),
+            set_gaming_mode(true),
             set_customize_ambient(true, 2, 0, 4),
         ];
         for mut cmd in cmds {
@@ -449,5 +459,10 @@ mod tests {
         let pkt = extract_packets(&mut siren).pop().unwrap();
         assert!(apply_packet(&mut st, &pkt));
         assert!(st.siren_detect);
+
+        let mut gm = encode(msg_id::UNIVERSAL_ACK, &[msg_id::ADJUST_SOUND_SYNC, 1]);
+        let pkt = extract_packets(&mut gm).pop().unwrap();
+        assert!(apply_packet(&mut st, &pkt));
+        assert!(st.gaming_mode);
     }
 }
