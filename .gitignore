@@ -1,6 +1,4 @@
+/target/
 bin/
 obj/
-.vs/
-*.user
-*.suo
 *.log

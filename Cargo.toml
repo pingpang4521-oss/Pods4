@@ -1,0 +1,23 @@
+[package]
+name = "pods4"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Windows desktop & tray passthrough and noise controller for Samsung Galaxy Buds4 Pro"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+tray-icon = "0.26"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
