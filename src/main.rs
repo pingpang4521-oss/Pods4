@@ -1,434 +1,182 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod applog;
 mod bluetooth;
+mod codec;
+mod control;
+mod install;
+mod instance;
+mod notify;
 mod protocol;
+mod settings;
+mod tray;
+mod widgets;
+mod win;
 
-use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
-use std::os::windows::process::CommandExt;
-use std::process::Command;
-use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2, ViewportCommand};
+use eframe::egui::{self, Margin, RichText, Vec2, ViewportCommand};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HWND, WAIT_OBJECT_0,
-};
-use windows_sys::Win32::System::Registry::{RegGetValueA, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
-use windows_sys::Win32::System::Threading::{
-    CreateEventA, CreateMutexA, GetExitCodeProcess, SetEvent, WaitForSingleObject, INFINITE,
-};
-use windows_sys::Win32::UI::Shell::{
-    ShellExecuteExW, ShellExecuteW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IsIconic, IsWindowVisible, MessageBoxW, PostMessageW, SetForegroundWindow, SetWindowPos,
-    ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONERROR, MB_OK, SWP_NOMOVE, SWP_NOSIZE,
-    SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, WM_CLOSE,
+    IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
 };
 
 use bluetooth::BudsClient;
+use codec::CodecState;
+use control::AppControl;
+use instance::SingleInstanceGuard;
+use notify::Notifier;
 use protocol::{
     set_ambient_during_calls, set_ambient_volume, set_anc_level, set_customize_ambient,
     set_gaming_mode, set_noise_control, set_one_earbud_noise_control, set_siren_detect,
     set_voice_detect, set_voice_detect_duration, BudsState, NoiseControlMode, PlacementState,
 };
-
-const MUTEX_NAME: &[u8] = b"Local\\Pods4_SingleInstance\0";
-const SHOW_EVENT_NAME: &[u8] = b"Local\\Pods4_ShowWindow\0";
-
-// One UI-inspired dark palette: true-black canvas, soft charcoal cards, Samsung blue accent.
-const BG_MAIN: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
-const BG_CARD: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
-const BG_INSET: Color32 = Color32::from_rgb(0x2C, 0x2C, 0x2E);
-const DIVIDER: Color32 = Color32::from_rgb(0x38, 0x38, 0x3A);
-const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xFA, 0xFA, 0xFA);
-const TEXT_MUTED: Color32 = Color32::from_rgb(0xA0, 0xA0, 0xA5);
-const TEXT_DIM: Color32 = Color32::from_rgb(0x70, 0x70, 0x75);
-const ACCENT_BLUE: Color32 = Color32::from_rgb(0x38, 0x87, 0xF5);
-const ACCENT_GREEN_HI: Color32 = Color32::from_rgb(0x4C, 0xD9, 0x64);
-const ACCENT_AMBER: Color32 = Color32::from_rgb(0xFF, 0xB3, 0x40);
-const ACCENT_RED: Color32 = Color32::from_rgb(0xFF, 0x45, 0x3A);
+use settings::{SettingsStore, BATTERY_THRESHOLDS};
+use widgets::*;
+use win::VERSION;
 
 /// The buds push their full settings right after RFCOMM connects. If that packet never
 /// arrives, unlock the controls after this long rather than leaving them disabled forever.
 const INITIAL_SYNC_FALLBACK: Duration = Duration::from_secs(4);
+/// How long installer/uninstaller wait for a running copy to exit.
+const REPLACE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const BOOST_LABELS: [&str; 3] = ["-1", "Normal", "+1"];
 const TONE_LABELS: [&str; 5] = ["Soft +2", "Soft +1", "Neutral", "Clear +1", "Clear +2"];
 
-struct SingleInstanceGuard {
-    mutex: HANDLE,
-    show_event: HANDLE,
+const ICON_PNG: &[u8] = include_bytes!("../assets/pods4-256.png");
+
+// ---------------------------------------------------------------- command line
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Args {
+    /// Start hidden in the tray (used by "Start with Windows").
+    tray: bool,
+    /// Install this exe for the current user, then launch the installed copy.
+    install: bool,
+    /// Remove Pods4 (run from Settings › Apps).
+    uninstall: bool,
+    /// Close a running copy and take over (used after an in-app install).
+    replace: bool,
+    /// No confirmation or result dialogs (`QuietUninstallString`, scripted installs).
+    quiet: bool,
 }
 
-impl Drop for SingleInstanceGuard {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.show_event.is_null() {
-                SetEvent(self.show_event);
-                CloseHandle(self.show_event);
-            }
-            if !self.mutex.is_null() { CloseHandle(self.mutex); }
+fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
+    let mut a = Args::default();
+    for arg in args {
+        match arg.trim_start_matches(['-', '/']).to_ascii_lowercase().as_str() {
+            "tray" | "minimized" => a.tray = true,
+            "install" => a.install = true,
+            "uninstall" => a.uninstall = true,
+            "replace" => a.replace = true,
+            "quiet" | "silent" => a.quiet = true,
+            _ => {}
         }
     }
+    a
 }
 
-fn acquire_single_instance() -> Option<SingleInstanceGuard> {
-    unsafe {
-        let mutex = CreateMutexA(null(), 1, MUTEX_NAME.as_ptr());
-        let already = GetLastError() == ERROR_ALREADY_EXISTS;
-        let show_event = CreateEventA(null(), 0, 0, SHOW_EVENT_NAME.as_ptr());
-        if already {
-            if !show_event.is_null() {
-                SetEvent(show_event);
-                CloseHandle(show_event);
-            }
-            if !mutex.is_null() {
-                CloseHandle(mutex);
-            }
-            return None;
-        }
-        Some(SingleInstanceGuard { mutex, show_event })
-    }
+// ---------------------------------------------------------------- install / uninstall flows
+
+/// Shows a message box unless running quietly; returns the button pressed (IDYES when quiet).
+fn tell(quiet: bool, text: &str, flags: u32) -> i32 {
+    if quiet { IDYES } else { win::message_box(text, flags) }
 }
 
-fn make_dot_icon(r: u8, g: u8, b: u8) -> Icon {
-    const S: usize = 32;
-    let mut rgba = vec![0u8; S * S * 4];
-    let cx = 15.5_f32;
-    let cy = 15.5_f32;
-    for y in 0..S {
-        for x in 0..S {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let idx = (y * S + x) * 4;
-            if dist <= 13.0 {
-                let is_ring = (6.0..=8.4).contains(&dist);
-                let (pr, pg, pb) = if is_ring { (255, 255, 255) } else { (r, g, b) };
-                let alpha = if dist > 12.0 { ((13.0 - dist) * 255.0) as u8 } else { 255 };
-                rgba[idx] = pr;
-                rgba[idx + 1] = pg;
-                rgba[idx + 2] = pb;
-                rgba[idx + 3] = alpha;
-            }
-        }
-    }
-    Icon::from_rgba(rgba, S as u32, S as u32).expect("valid RGBA icon")
-}
+const STILL_RUNNING: &str = "Pods4 is still running and could not be closed.\n\nExit it from the tray icon and try again.";
 
-fn mode_rgb(mode: NoiseControlMode) -> (u8, u8, u8) {
-    match mode {
-        NoiseControlMode::Ambient => (0x10, 0xB9, 0x81),
-        NoiseControlMode::Anc => (0x3B, 0x82, 0xF6),
-        NoiseControlMode::Adaptive => (0x8B, 0x5C, 0xF6),
-        NoiseControlMode::Off => (0x64, 0x74, 0x8B),
-    }
-}
-
-struct TrayMenuIds {
-    show: MenuId,
-    ambient: MenuId,
-    anc: MenuId,
-    adaptive: MenuId,
-    off: MenuId,
-    reconnect: MenuId,
-    exit: MenuId,
-}
-
-fn build_tray() -> Result<(TrayIcon, TrayMenuIds), String> {
-    let menu = Menu::new();
-    let show = MenuItem::new("Show Controls", true, None);
-    let ambient = MenuItem::new("Ambient Sound (Passthrough)", true, None);
-    let anc = MenuItem::new("Active Noise Cancelling", true, None);
-    let adaptive = MenuItem::new("Adaptive", true, None);
-    let off = MenuItem::new("Off", true, None);
-    let reconnect = MenuItem::new("Reconnect", true, None);
-    let exit = MenuItem::new("Exit", true, None);
-
-    let ids = TrayMenuIds {
-        show: show.id().clone(),
-        ambient: ambient.id().clone(),
-        anc: anc.id().clone(),
-        adaptive: adaptive.id().clone(),
-        off: off.id().clone(),
-        reconnect: reconnect.id().clone(),
-        exit: exit.id().clone(),
+fn run_cli_install(quiet: bool) {
+    let Some(guard) = instance::acquire_replacing(REPLACE_TIMEOUT) else {
+        tell(quiet, STILL_RUNNING, MB_OK | MB_ICONERROR);
+        return;
     };
-
-    let _ = menu.append_items(&[
-        &show,
-        &PredefinedMenuItem::separator(),
-        &ambient,
-        &anc,
-        &adaptive,
-        &off,
-        &PredefinedMenuItem::separator(),
-        &reconnect,
-        &exit,
-    ]);
-
-    let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
-        .with_tooltip("Pods4 — Passthrough & Noise Controls")
-        .with_icon(make_dot_icon(0x64, 0x74, 0x8B))
-        .build()
-        .map_err(|e| format!("Failed to create system tray icon: {e}"))?;
-
-    Ok((tray, ids))
-}
-
-fn show_error_box(msg: &str) {
-    let title = wide("Pods4 — Startup Error");
-    let body = wide(msg);
-    unsafe {
-        MessageBoxW(null_mut(), body.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
-    }
-}
-
-fn show_hwnd(hwnd: isize, ctx: &egui::Context) {
-    if hwnd == 0 {
-        return;
-    }
-    let h = hwnd as HWND;
-    unsafe {
-        ShowWindow(h, SW_SHOW);
-        if IsIconic(h) != 0 {
-            ShowWindow(h, SW_RESTORE);
+    match install::install() {
+        Ok(exe) => {
+            drop(guard);
+            if let Err(e) = install::launch(&exe, &[]) {
+                tell(quiet, &format!("Pods4 was installed but could not be started:\n\n{e}"), MB_OK | MB_ICONWARNING);
+            }
         }
-        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        SetForegroundWindow(h);
+        Err(e) => {
+            log_warn!("Install failed: {e}");
+            tell(quiet, &format!("Pods4 could not be installed:\n\n{e}"), MB_OK | MB_ICONERROR);
+        }
     }
-    ctx.request_repaint();
 }
 
-fn hide_hwnd(hwnd: isize) {
-    if hwnd == 0 {
+fn run_uninstall(quiet: bool) {
+    let mut text = "Remove Pods4 from this PC?\n\nThis removes the app, its Start menu and startup entries, \
+                    and its settings and logs."
+        .to_string();
+    if codec::read_sbc_forced() {
+        text += "\n\nWindows is still set to use the SBC codec instead of AAC. To switch back, turn off \
+                 \"Force SBC codec\" in Pods4 first.";
+    }
+    if tell(quiet, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES {
         return;
     }
-    unsafe {
-        ShowWindow(hwnd as HWND, SW_HIDE);
-    }
+    let Some(guard) = instance::acquire_replacing(REPLACE_TIMEOUT) else {
+        tell(quiet, STILL_RUNNING, MB_OK | MB_ICONERROR);
+        return;
+    };
+    let result = install::uninstall();
+    drop(guard);
+    match result {
+        Ok(()) => tell(quiet, "Pods4 has been removed.", MB_OK | MB_ICONINFORMATION),
+        Err(e) => tell(
+            quiet,
+            &format!("Pods4 was removed, but some files could not be deleted:\n\n{e}"),
+            MB_OK | MB_ICONWARNING,
+        ),
+    };
 }
 
-fn is_hwnd_showing(hwnd: isize) -> bool {
-    if hwnd == 0 {
+/// A second launch from a different copy than the installed one: offer to update the install.
+fn offer_update_of_installed() -> bool {
+    if !install::is_installed() || install::is_running_installed() {
         return false;
     }
-    let h = hwnd as HWND;
-    unsafe { IsWindowVisible(h) != 0 && IsIconic(h) == 0 }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// Returns true when Windows Bluetooth A2DP AAC is disabled (forcing lower-latency SBC).
-fn read_sbc_forced() -> bool {
-    let mut val: u32 = 1;
-    let mut size: u32 = size_of::<u32>() as u32;
-    let rc = unsafe {
-        RegGetValueA(
-            HKEY_LOCAL_MACHINE,
-            c"SYSTEM\\CurrentControlSet\\Services\\BthA2dp\\Parameters".as_ptr().cast(),
-            c"BluetoothAacEnable".as_ptr().cast(),
-            RRF_RT_REG_DWORD,
-            null_mut(),
-            (&mut val as *mut u32).cast::<c_void>(),
-            &mut size,
-        )
-    };
-    rc == ERROR_SUCCESS && val == 0
-}
-
-fn open_sound_settings() {
-    let verb = wide("open");
-    let uri = wide("ms-settings:sound");
-    unsafe {
-        ShellExecuteW(null_mut(), verb.as_ptr(), uri.as_ptr(), null(), null(), SW_SHOWNORMAL);
-    }
-}
-
-struct CodecState {
-    force_sbc: bool,
-    busy: bool,
-    note: String,
-}
-
-fn system32_exe(name: &str) -> String {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    format!(r"{root}\System32\{name}")
-}
-
-/// Picks the A2DP sink instance ID belonging to one of `addresses` (in priority order) from
-/// `pnputil /enum-devices` output. Several headsets can be connected at once, so the Bluetooth
-/// address embedded in the ID (`...&0&5CD33D4AA290_C00000000`) must match, or we'd restart the
-/// wrong device.
-fn pick_a2dp_instance_id(pnputil_output: &str, addresses: &[u64]) -> Option<String> {
-    const PREFIX: &str = r"bthenum\{0000110b-0000-1000-8000-00805f9b34fb}_";
-    let ids: Vec<&str> = pnputil_output
-        .lines()
-        .filter_map(|line| {
-            let pos = line.to_ascii_lowercase().find(PREFIX)?;
-            let id = line[pos..].trim();
-            // The ID is pasted into an elevated cmd line: refuse anything that could escape quoting.
-            let safe = !id.is_empty() && !id.chars().any(|c| matches!(c, '"' | '%' | '!' | '^' | '\r' | '\n'));
-            safe.then_some(id)
-        })
-        .collect();
-    addresses.iter().find_map(|&addr| {
-        let needle = format!("&{addr:012x}_");
-        ids.iter().find(|id| id.to_ascii_lowercase().contains(&needle)).map(|id| id.to_string())
-    })
-}
-
-fn find_a2dp_instance_id(addresses: &[u64]) -> Option<String> {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    if addresses.is_empty() {
-        return None;
-    }
-    let out = Command::new(system32_exe("pnputil.exe"))
-        .args(["/enum-devices", "/connected"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    pick_a2dp_instance_id(&String::from_utf8_lossy(&out.stdout), addresses)
-}
-
-/// Builds the `cmd.exe` parameters. The whole command is wrapped in one extra pair of quotes:
-/// with more than two quotes, `cmd /c` strips the first and last one, which would otherwise
-/// mangle the quoted `reg.exe` path and fail with "The system cannot find the path specified".
-fn sbc_command_line(reg_exe: &str, pnputil_exe: &str, aac_val: u32, instance_id: Option<&str>) -> String {
-    let reg = format!(
-        "\"{reg_exe}\" add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\BthA2dp\\Parameters\" /v BluetoothAacEnable /t REG_DWORD /d {aac_val} /f"
+    let installed = install::installed_version().unwrap_or_else(|| "unknown".into());
+    let text = format!(
+        "Pods4 is already running.\n\nReplace the installed copy (version {installed}) with this one (version {VERSION})?"
     );
-    match instance_id {
-        Some(id) => format!("/c \"{reg} && \"{pnputil_exe}\" /restart-device \"{id}\"\""),
-        None => format!("/c \"{reg}\""),
-    }
+    win::message_box(&text, MB_YESNO | MB_ICONQUESTION) == IDYES
 }
 
-fn apply_sbc_forced_async(
-    force_sbc: bool,
-    codec: Arc<Mutex<CodecState>>,
-    client: BudsClient,
-    ctx: egui::Context,
-) {
-    {
-        let mut st = codec.lock().unwrap();
-        if st.busy {
-            return;
-        }
-        st.busy = true;
-        st.note = "Waiting for Windows admin permission...".into();
-    }
-    ctx.request_repaint();
+// ---------------------------------------------------------------- app
 
-    thread::spawn(move || {
-        let aac_val = if force_sbc { 0 } else { 1 };
-        // Prefer the buds we're (or were last) connected to, then any paired buds.
-        let mut addresses: Vec<u64> = client.snapshot().device_address.into_iter().collect();
-        for d in bluetooth::rank_candidates(bluetooth::find_paired_devices()) {
-            if !addresses.contains(&d.address) {
-                addresses.push(d.address);
-            }
-        }
-        let instance_id = find_a2dp_instance_id(&addresses);
-        let cmd = sbc_command_line(
-            &system32_exe("reg.exe"),
-            &system32_exe("pnputil.exe"),
-            aac_val,
-            instance_id.as_deref(),
-        );
-        let verb = wide("runas");
-        let file = wide(&system32_exe("cmd.exe"));
-        let params = wide(&cmd);
-
-        let mut sei: SHELLEXECUTEINFOW = unsafe { zeroed() };
-        sei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-        sei.lpVerb = verb.as_ptr();
-        sei.lpFile = file.as_ptr();
-        sei.lpParameters = params.as_ptr();
-        sei.nShow = SW_HIDE;
-
-        let ok = unsafe { ShellExecuteExW(&mut sei) != 0 };
-        let mut wait_rc = u32::MAX;
-        let mut exit_code = 1u32;
-        if ok && !sei.hProcess.is_null() {
-            unsafe {
-                wait_rc = WaitForSingleObject(sei.hProcess, 60_000);
-                if wait_rc == WAIT_OBJECT_0 {
-                    let _ = GetExitCodeProcess(sei.hProcess, &mut exit_code);
-                }
-                CloseHandle(sei.hProcess);
-            }
-        }
-
-        let actual = read_sbc_forced();
-        let restarted = instance_id.is_some() && ok && wait_rc == WAIT_OBJECT_0 && exit_code == 0;
-        {
-            let mut st = codec.lock().unwrap();
-            st.force_sbc = actual;
-            st.busy = false;
-            st.note = if !ok {
-                "Permission canceled — codec unchanged.".into()
-            } else if wait_rc != WAIT_OBJECT_0 {
-                "Timed out waiting for Windows codec update.".into()
-            } else if actual != force_sbc {
-                "Registry update failed — try running as administrator.".into()
-            } else if exit_code != 0 {
-                "Registry updated, but A2DP restart failed — reconnect Buds or reboot.".into()
-            } else if restarted {
-                if actual {
-                    "SBC active (A2DP restarted). Reboot PC once if delay doesn't drop.".into()
-                } else {
-                    "AAC restored (A2DP restarted).".into()
-                }
-            } else if actual {
-                "SBC active (reconnect Buds to apply).".into()
-            } else {
-                "AAC restored (reconnect Buds to apply).".into()
-            };
-        }
-        ctx.request_repaint();
-
-        if restarted {
-            thread::sleep(std::time::Duration::from_millis(800));
-            client.connect_auto_async();
-        }
-    });
+enum InstallStatus {
+    Idle,
+    Busy,
+    Failed(String),
 }
 
 struct Pods4App {
+    control: AppControl,
     client: BudsClient,
+    settings: Arc<SettingsStore>,
+    notifier: Notifier,
+    tray: tray::Tray,
+    _instance: SingleInstanceGuard,
+
     ui_state: BudsState,
-    last_mode: NoiseControlMode,
-    last_connected: bool,
     slider_dragging: bool,
     /// When the current connection came up; drives the initial-sync fallback.
     connected_since: Option<Instant>,
     codec: Arc<Mutex<CodecState>>,
-    tray: TrayIcon,
-    hwnd: isize,
-    exiting: Arc<AtomicBool>,
+
+    autostart: bool,
+    autostart_note: Option<String>,
+    running_installed: bool,
+    installed_version: Option<String>,
+    install_status: Arc<Mutex<InstallStatus>>,
 }
 
 impl Pods4App {
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        client: BudsClient,
-        show_event: HANDLE,
-    ) -> Result<Self, String> {
+    fn new(cc: &eframe::CreationContext<'_>, client: BudsClient, instance: SingleInstanceGuard) -> Result<Self, String> {
         let hwnd: isize = cc
             .window_handle()
             .ok()
@@ -438,134 +186,227 @@ impl Pods4App {
             })
             .unwrap_or(0);
 
-        // Dark theme styling
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = BG_MAIN;
-        visuals.window_fill = BG_MAIN;
-        visuals.widgets.noninteractive.bg_fill = BG_CARD;
-        visuals.widgets.inactive.bg_fill = BG_INSET;
-        visuals.widgets.inactive.weak_bg_fill = BG_INSET;
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x3A, 0x3A, 0x3C);
-        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x3A, 0x3A, 0x3C);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(0x48, 0x48, 0x4A);
-        visuals.selection.bg_fill = ACCENT_BLUE;
-        visuals.slider_trailing_fill = true;
-        cc.egui_ctx.set_visuals(visuals);
+        apply_theme(&cc.egui_ctx);
 
-        let (tray, menu_ids) = build_tray()?;
-        let exiting = Arc::new(AtomicBool::new(false));
+        let control = AppControl::new(cc.egui_ctx.clone(), client.clone(), hwnd);
+        let settings = Arc::new(SettingsStore::load(win::data_dir().join("settings.ini")));
+        let notifier = Notifier::spawn(client.clone(), settings.clone());
+        let tray = tray::spawn(control.clone())?;
+        control.set_tray_thread(tray.refresher.thread_id());
 
-        // Repaint UI whenever Bluetooth state changes
-        let ctx_bt = cc.egui_ctx.clone();
-        client.set_on_update(Arc::new(move || ctx_bt.request_repaint()));
+        // Bluetooth updates: repaint the window, refresh the tray, check battery alerts.
+        let ctx = cc.egui_ctx.clone();
+        let refresher = tray.refresher;
+        let n = notifier.clone();
+        client.set_on_update(Arc::new(move || {
+            ctx.request_repaint();
+            refresher.refresh();
+            n.state_changed();
+        }));
 
-        // Watch second-instance wake signal (directly calls Win32 ShowWindow so it works while hidden)
-        if !show_event.is_null() {
-            let ctx_wake = cc.egui_ctx.clone();
-            let client_wake = client.clone();
-            let exit_wake = exiting.clone();
-            let show_event_addr = show_event as usize;
-            thread::spawn(move || {
-                let h = show_event_addr as HANDLE;
-                loop {
-                    let rc = unsafe { WaitForSingleObject(h, INFINITE) };
-                    if rc != WAIT_OBJECT_0 || exit_wake.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    show_hwnd(hwnd, &ctx_wake);
-                    if !client_wake.is_connected() {
-                        client_wake.connect_auto_async();
-                    }
-                }
-            });
-        }
-
-        // Watch tray clicks & menu actions (works reliably even when main window is hidden)
-        let ctx_tray = cc.egui_ctx.clone();
-        let exit_tray = exiting.clone();
-        let client_tray = client.clone();
-        thread::spawn(move || loop {
-            let mut handled = false;
-            while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-                handled = true;
-                if let TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                } = ev
-                {
-                    if is_hwnd_showing(hwnd) {
-                        hide_hwnd(hwnd);
-                    } else {
-                        show_hwnd(hwnd, &ctx_tray);
-                        if !client_tray.is_connected() {
-                            client_tray.connect_auto_async();
-                        }
-                    }
-                }
-            }
-
-            while let Ok(ev) = MenuEvent::receiver().try_recv() {
-                handled = true;
-                if ev.id == menu_ids.show {
-                    show_hwnd(hwnd, &ctx_tray);
-                    if !client_tray.is_connected() {
-                        client_tray.connect_auto_async();
-                    }
-                } else if let Some(mode) = [
-                    (&menu_ids.ambient, NoiseControlMode::Ambient),
-                    (&menu_ids.anc, NoiseControlMode::Anc),
-                    (&menu_ids.adaptive, NoiseControlMode::Adaptive),
-                    (&menu_ids.off, NoiseControlMode::Off),
-                ]
-                .into_iter()
-                .find_map(|(id, mode)| (ev.id == *id).then_some(mode))
-                {
-                    client_tray.send_with(set_noise_control(mode), |st| st.mode = mode);
-                } else if ev.id == menu_ids.reconnect {
-                    client_tray.connect_auto_async();
-                } else if ev.id == menu_ids.exit {
-                    exit_tray.store(true, Ordering::SeqCst);
-                    client_tray.disconnect();
-                    if hwnd != 0 {
-                        unsafe { PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0); }
-                    }
-                    ctx_tray.send_viewport_cmd(ViewportCommand::Close);
-                    ctx_tray.request_repaint();
-                    return;
-                }
-            }
-
-            thread::sleep(std::time::Duration::from_millis(if handled { 15 } else { 60 }));
-        });
-
+        instance.watch(control.clone());
         client.connect_auto_async();
 
+        let installed_version = install::is_installed().then(install::installed_version).flatten();
         Ok(Self {
+            control,
             client,
+            settings,
+            notifier,
+            tray,
+            _instance: instance,
             ui_state: BudsState::default(),
-            last_mode: NoiseControlMode::Off,
-            last_connected: false,
             slider_dragging: false,
             connected_since: None,
-            codec: Arc::new(Mutex::new(CodecState {
-                force_sbc: read_sbc_forced(),
-                busy: false,
-                note: String::new(),
-            })),
-            tray,
-            hwnd,
-            exiting,
+            codec: Arc::new(Mutex::new(CodecState::load())),
+            autostart: install::autostart_enabled(),
+            autostart_note: None,
+            running_installed: install::is_running_installed(),
+            installed_version,
+            install_status: Arc::new(Mutex::new(InstallStatus::Idle)),
         })
+    }
+
+    fn hide_to_tray(&self) {
+        self.control.hide();
+        if !self.settings.get().tray_hint_shown {
+            self.notifier.toast(
+                "Pods4 is still running",
+                "It keeps your buds connected from the system tray. Right-click the tray icon to exit.",
+            );
+            self.settings.update(|s| s.tray_hint_shown = true);
+        }
+    }
+
+    /// Installs this copy, then hands over to the installed exe and exits.
+    fn start_install(&self) {
+        {
+            let mut st = self.install_status.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*st, InstallStatus::Busy) {
+                return;
+            }
+            *st = InstallStatus::Busy;
+        }
+        let status = self.install_status.clone();
+        let control = self.control.clone();
+        thread::spawn(move || {
+            let result = install::install().and_then(|exe| {
+                install::launch(&exe, &["--replace"]).map_err(|e| format!("Installed, but could not start it: {e}"))
+            });
+            match result {
+                // The new copy asks us to exit too; exiting right away is just faster.
+                Ok(()) => control.exit(),
+                Err(e) => {
+                    log_warn!("Install failed: {e}");
+                    *status.lock().unwrap_or_else(|e| e.into_inner()) = InstallStatus::Failed(e);
+                    control.ctx.request_repaint();
+                }
+            }
+        });
+    }
+
+    fn install_label(&self) -> &'static str {
+        if self.installed_version.is_some() { "Update" } else { "Install" }
+    }
+
+    fn header(&mut self, ui: &mut egui::Ui, snap: &bluetooth::ConnectionSnapshot, status_text: &str) {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 105.0).max(160.0));
+                ui.add(
+                    egui::Label::new(RichText::new(&snap.device_name).size(27.0).strong().color(TEXT_PRIMARY))
+                        .truncate(),
+                );
+                ui.horizontal(|ui| {
+                    let dot_color = if snap.connected {
+                        ACCENT_GREEN_HI
+                    } else if snap.connecting {
+                        ACCENT_AMBER
+                    } else {
+                        ACCENT_RED
+                    };
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.0, dot_color);
+                    ui.label(RichText::new(status_text).size(12.5).color(TEXT_MUTED));
+                });
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if action_button(ui, "Reconnect", BG_CARD, !snap.connecting).clicked() {
+                    self.client.connect_auto_async();
+                }
+            });
+        });
+        ui.add_space(16.0);
+    }
+
+    /// Shown by a portable copy until it is installed or dismissed.
+    fn install_banner(&mut self, ui: &mut egui::Ui) {
+        if self.running_installed || self.settings.get().install_banner_dismissed {
+            return;
+        }
+        let busy = matches!(*self.install_status.lock().unwrap_or_else(|e| e.into_inner()), InstallStatus::Busy);
+        card_filled(ui, egui::Color32::from_rgb(0x14, 0x24, 0x3D), |ui| {
+            let (title, subtitle) = match &self.installed_version {
+                Some(v) => (
+                    format!("Update installed Pods4 ({v} → {VERSION})"),
+                    "Replaces the installed copy with this one.".to_string(),
+                ),
+                None => (
+                    "Install Pods4".to_string(),
+                    "Adds it to the Start menu, lets it start with Windows, and puts an uninstaller in \
+                     Settings › Apps. No admin needed."
+                        .to_string(),
+                ),
+            };
+            ui.label(RichText::new(title).size(14.5).strong().color(TEXT_PRIMARY));
+            ui.add_space(2.0);
+            ui.label(RichText::new(subtitle).size(11.5).color(TEXT_MUTED));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if primary_button(ui, if busy { "Installing..." } else { self.install_label() }, !busy).clicked() {
+                    self.start_install();
+                }
+                if action_button(ui, "Not now", BG_INSET, !busy).clicked() {
+                    self.settings.update(|s| s.install_banner_dismissed = true);
+                }
+            });
+        });
+    }
+
+    fn app_card(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            section_title(ui, "App");
+
+            let mut autostart = self.autostart;
+            if toggle_row(ui, "Start with Windows", "Opens quietly in the tray when you sign in", &mut autostart) {
+                match install::set_autostart(autostart) {
+                    Ok(()) => {
+                        self.autostart = autostart;
+                        self.autostart_note = None;
+                    }
+                    Err(e) => {
+                        log_warn!("Could not change autostart: {e}");
+                        self.autostart_note = Some(e);
+                    }
+                }
+            }
+            if let Some(note) = &self.autostart_note {
+                ui.label(RichText::new(note).size(11.5).color(ACCENT_RED));
+            }
+
+            divider(ui);
+            let prefs = self.settings.get();
+            let mut alerts = prefs.low_battery_alerts;
+            let subtitle = format!("Notify when an earbud drops to {}%", prefs.low_battery_threshold);
+            if toggle_row(ui, "Low battery alerts", &subtitle, &mut alerts) {
+                self.settings.update(|s| s.low_battery_alerts = alerts);
+            }
+            ui.add_space(8.0);
+            ui.add_enabled_ui(alerts, |ui| {
+                ui.columns(BATTERY_THRESHOLDS.len(), |cols| {
+                    for (i, t) in BATTERY_THRESHOLDS.into_iter().enumerate() {
+                        let active = prefs.low_battery_threshold == t;
+                        if pill_button(&mut cols[i], &format!("{t}%"), active, 30.0, 12.0).clicked() && !active {
+                            self.settings.update(|s| s.low_battery_threshold = t);
+                        }
+                    }
+                });
+            });
+
+            divider(ui);
+            let status_subtitle = if self.running_installed {
+                "Installed · remove it from Settings › Apps".to_string()
+            } else if let Some(v) = &self.installed_version {
+                format!("Portable copy · installed version is {v}")
+            } else {
+                "Portable copy · not installed".to_string()
+            };
+            let busy = matches!(*self.install_status.lock().unwrap_or_else(|e| e.into_inner()), InstallStatus::Busy);
+            labeled_row(ui, &format!("Pods4 {VERSION}"), &status_subtitle, |ui| {
+                if !self.running_installed
+                    && primary_button(ui, if busy { "Installing..." } else { self.install_label() }, !busy).clicked()
+                {
+                    self.start_install();
+                }
+                if action_button(ui, "Logs", BG_INSET, true).clicked() {
+                    win::shell_open(win::log_dir());
+                }
+            });
+            if let InstallStatus::Failed(e) = &*self.install_status.lock().unwrap_or_else(|e| e.into_inner()) {
+                ui.add_space(4.0);
+                ui.label(RichText::new(e).size(11.5).color(ACCENT_RED));
+            }
+        });
     }
 }
 
 impl eframe::App for Pods4App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Intercept window X button -> hide to system tray instead of exiting
-        if ctx.input(|i| i.viewport().close_requested()) && !self.exiting.load(Ordering::SeqCst) {
+        // Window X button hides to the tray instead of exiting.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.control.is_exiting() {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            hide_hwnd(self.hwnd);
+            self.hide_to_tray();
             return;
         }
 
@@ -598,63 +439,13 @@ impl eframe::App for Pods4App {
             snap.status_text.clone()
         };
 
-        if self.ui_state.mode != self.last_mode || snap.connected != self.last_connected {
-            self.last_mode = self.ui_state.mode;
-            self.last_connected = snap.connected;
-            let (r, g, b) = if snap.connected {
-                mode_rgb(self.last_mode)
-            } else {
-                (0x64, 0x74, 0x8B)
-            };
-            let tip = if snap.connected {
-                format!("{} — {}", snap.device_name, self.last_mode.label())
-            } else {
-                format!("{} — Disconnected", snap.device_name)
-            };
-            let _ = self.tray.set_icon(Some(make_dot_icon(r, g, b)));
-            let _ = self.tray.set_tooltip(Some(tip));
-        }
-
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG_MAIN).inner_margin(Margin::symmetric(16, 10)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     // 1. Header: large One UI style title + connection status
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_max_width((ui.available_width() - 105.0).max(160.0));
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&snap.device_name).size(27.0).strong().color(TEXT_PRIMARY),
-                                )
-                                .truncate(),
-                            );
-                            ui.horizontal(|ui| {
-                                let dot_color = if snap.connected {
-                                    ACCENT_GREEN_HI
-                                } else if snap.connecting {
-                                    ACCENT_AMBER
-                                } else {
-                                    ACCENT_RED
-                                };
-                                let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                                ui.painter().circle_filled(rect.center(), 4.0, dot_color);
-                                ui.label(RichText::new(&status_text).size(12.5).color(TEXT_MUTED));
-                            });
-                        });
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let btn = egui::Button::new(RichText::new("Reconnect").size(12.5).strong().color(ACCENT_BLUE))
-                                .fill(BG_CARD)
-                                .corner_radius(CornerRadius::same(16))
-                                .min_size(Vec2::new(0.0, 32.0));
-                            if ui.add_enabled(!snap.connecting, btn).clicked() {
-                                self.client.connect_auto_async();
-                            }
-                        });
-                    });
-                    ui.add_space(16.0);
+                    self.header(ui, &snap, &status_text);
+                    self.install_banner(ui);
 
                     // 2. Battery card
                     ui.add_enabled_ui(snap.connected, |ui| {
@@ -846,7 +637,7 @@ impl eframe::App for Pods4App {
                         section_title(ui, "Low latency & sync");
 
                         let (mut force_sbc, busy, note) = {
-                            let c = self.codec.lock().unwrap();
+                            let c = self.codec.lock().unwrap_or_else(|e| e.into_inner());
                             (c.force_sbc, c.busy, c.note.clone())
                         };
                         ui.add_enabled_ui(!busy, |ui| {
@@ -856,7 +647,7 @@ impl eframe::App for Pods4App {
                                 "Cuts Windows Bluetooth lag by ~100–150 ms; asks for admin once",
                                 &mut force_sbc,
                             ) {
-                                apply_sbc_forced_async(
+                                codec::apply_sbc_forced_async(
                                     force_sbc,
                                     self.codec.clone(),
                                     self.client.clone(),
@@ -883,22 +674,15 @@ impl eframe::App for Pods4App {
                         });
 
                         divider(ui);
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new("Audio output & enhancements").size(14.0).color(TEXT_PRIMARY));
-                                ui.label(RichText::new("Bypass Voicemeeter and turn Enhancements off").size(11.5).color(TEXT_MUTED));
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let btn = egui::Button::new(RichText::new("Open").size(12.5).strong().color(ACCENT_BLUE))
-                                    .fill(BG_INSET)
-                                    .corner_radius(CornerRadius::same(16))
-                                    .min_size(Vec2::new(0.0, 32.0));
-                                if ui.add(btn).clicked() {
-                                    open_sound_settings();
-                                }
-                            });
+                        labeled_row(ui, "Audio output & enhancements", "Bypass Voicemeeter and turn Enhancements off", |ui| {
+                            if action_button(ui, "Open", BG_INSET, true).clicked() {
+                                win::shell_open("ms-settings:sound");
+                            }
                         });
                     });
+
+                    // 8. App: autostart, alerts, install status
+                    self.app_card(ui);
                     ui.add_space(6.0);
                 });
             });
@@ -906,152 +690,72 @@ impl eframe::App for Pods4App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.exiting.store(true, Ordering::SeqCst);
-        self.client.disconnect();
+        self.control.exit();
+        self.tray.wait_closed();
     }
-}
-
-fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::NONE
-        .fill(BG_CARD)
-        .corner_radius(CornerRadius::same(24))
-        .inner_margin(Margin::same(18))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add_contents(ui);
-        });
-    ui.add_space(12.0);
-}
-
-fn section_title(ui: &mut egui::Ui, title: &str) {
-    ui.label(RichText::new(title).size(13.5).strong().color(ACCENT_BLUE));
-    ui.add_space(10.0);
-}
-
-fn divider(ui: &mut egui::Ui) {
-    ui.add_space(10.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, DIVIDER);
-    ui.add_space(10.0);
-}
-
-fn battery_badge(ui: &mut egui::Ui, title: &str, pct: Option<u8>, sub: &str) {
-    ui.vertical_centered(|ui| {
-        ui.label(RichText::new(title).size(12.0).color(TEXT_MUTED));
-        let value = pct.map_or("—".to_string(), |p| format!("{p}%"));
-        ui.label(RichText::new(value).size(24.0).strong().color(TEXT_PRIMARY));
-
-        // Thin battery bar
-        let w = (ui.available_width() - 16.0).clamp(20.0, 90.0);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 5.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, CornerRadius::same(3), BG_INSET);
-        if let Some(p) = pct {
-            let fill_w = rect.width() * (p.min(100) as f32 / 100.0);
-            let color = match p {
-                0..=15 => ACCENT_RED,
-                16..=30 => ACCENT_AMBER,
-                _ => ACCENT_GREEN_HI,
-            };
-            let fill = egui::Rect::from_min_size(rect.min, Vec2::new(fill_w, rect.height()));
-            ui.painter().rect_filled(fill, CornerRadius::same(3), color);
-        }
-        ui.add_space(2.0);
-        ui.label(RichText::new(sub).size(11.0).color(TEXT_DIM));
-    });
-}
-
-/// Rounded One UI style choice button (filled blue when selected).
-fn pill_button(ui: &mut egui::Ui, label: &str, active: bool, height: f32, size: f32) -> egui::Response {
-    let btn = egui::Button::new(
-        RichText::new(label)
-            .size(size)
-            .strong()
-            .color(if active { Color32::WHITE } else { TEXT_MUTED }),
-    )
-    .fill(if active { ACCENT_BLUE } else { BG_INSET })
-    .stroke(Stroke::NONE)
-    .corner_radius(CornerRadius::same((height / 2.0) as u8))
-    .min_size(Vec2::new(ui.available_width(), height));
-    ui.add(btn)
-}
-
-fn slider_header(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(13.5).color(TEXT_PRIMARY));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(value).size(12.5).strong().color(ACCENT_BLUE));
-        });
-    });
-}
-
-fn full_width_slider(ui: &mut egui::Ui, val: &mut u8, range: std::ops::RangeInclusive<u8>) -> egui::Response {
-    ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(80.0);
-    ui.add(egui::Slider::new(val, range).show_value(false).trailing_fill(true))
-}
-
-fn toggle_row(ui: &mut egui::Ui, title: &str, subtitle: &str, on: &mut bool) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.set_max_width((ui.available_width() - 60.0).max(120.0));
-            ui.label(RichText::new(title).size(14.0).color(TEXT_PRIMARY));
-            ui.label(RichText::new(subtitle).size(11.5).color(TEXT_MUTED));
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if pill_switch(ui, on).clicked() {
-                clicked = true;
-            }
-        });
-    });
-    clicked
-}
-
-/// One UI style switch: blue track when on, grey when off, white thumb.
-fn pill_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
-    let desired = Vec2::new(46.0, 26.0);
-    let (rect, mut resp) = ui.allocate_exact_size(desired, egui::Sense::click());
-    if resp.clicked() {
-        *on = !*on;
-        resp.mark_changed();
-    }
-    let t = ui.ctx().animate_bool_responsive(resp.id, *on);
-    let off_bg = Color32::from_rgb(0x58, 0x58, 0x5C);
-    let bg = Color32::from_rgb(
-        (off_bg.r() as f32 + (ACCENT_BLUE.r() as f32 - off_bg.r() as f32) * t) as u8,
-        (off_bg.g() as f32 + (ACCENT_BLUE.g() as f32 - off_bg.g() as f32) * t) as u8,
-        (off_bg.b() as f32 + (ACCENT_BLUE.b() as f32 - off_bg.b() as f32) * t) as u8,
-    );
-    let r = rect.height() * 0.5;
-    ui.painter().rect_filled(rect, CornerRadius::same(r as u8), bg);
-    let cx = rect.left() + r + (rect.width() - 2.0 * r) * t;
-    ui.painter().circle_filled(egui::pos2(cx, rect.center().y), r - 3.0, Color32::WHITE);
-    resp
 }
 
 fn main() -> eframe::Result<()> {
-    let Some(_guard) = acquire_single_instance() else {
+    let args = parse_args(std::env::args().skip(1));
+    notify::set_process_app_id();
+
+    if args.uninstall {
+        run_uninstall(args.quiet);
+        return Ok(());
+    }
+
+    applog::init(&win::log_dir());
+    log_info!(
+        "Pods4 {VERSION} starting from {} {args:?}",
+        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+    );
+
+    if args.install {
+        run_cli_install(args.quiet);
+        return Ok(());
+    }
+
+    let guard = if args.replace { instance::acquire_replacing(REPLACE_TIMEOUT) } else { instance::try_acquire() };
+    let Some(guard) = guard else {
+        if args.replace {
+            log_warn!("Could not take over from the running copy");
+            win::message_box(
+                "The previous copy of Pods4 is still running.\n\nExit it from the tray icon and start Pods4 again.",
+                MB_OK | MB_ICONWARNING,
+            );
+        } else if offer_update_of_installed() {
+            run_cli_install(false);
+        } else {
+            instance::signal_show();
+        }
         return Ok(());
     };
-    let show_event = _guard.show_event;
+
+    notify::register_app_id();
     let client = BudsClient::new();
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Pods4 — Passthrough & Noise Controls")
-            .with_inner_size([430.0, 740.0])
-            .with_min_inner_size([380.0, 560.0])
-            .with_resizable(true),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Pods4")
+        .with_inner_size([430.0, 760.0])
+        .with_min_inner_size([380.0, 560.0])
+        .with_resizable(true)
+        .with_visible(!args.tray);
+    match eframe::icon_data::from_png_bytes(ICON_PNG) {
+        Ok(icon) => viewport = viewport.with_icon(Arc::new(icon)),
+        Err(e) => log_warn!("Could not decode window icon: {e}"),
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
 
     let res = eframe::run_native(
         "Pods4",
         options,
-        Box::new(move |cc| Ok(Box::new(Pods4App::new(cc, client, show_event)?))),
+        Box::new(move |cc| Ok(Box::new(Pods4App::new(cc, client, guard)?))),
     );
     if let Err(e) = &res {
-        show_error_box(&format!("Pods4 failed to start:\n\n{e}"));
+        log_warn!("Pods4 failed to start: {e}");
+        win::message_box(&format!("Pods4 failed to start:\n\n{e}"), MB_OK | MB_ICONERROR);
     }
+    log_info!("Stopped");
     res
 }
 
@@ -1059,47 +763,22 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::*;
 
-    // Trimmed real `pnputil /enum-devices /connected` output with three A2DP sinks connected.
-    const PNPUTIL: &str = r"
-Instance ID:                BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_VID&000105d6_PID&000a\7&b44bb26&0&4CFE2E270C51_C00000000
-Device Description:         JVC HA-A7T2
-Instance ID:                BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_VID&00010057_PID&0023\7&b44bb26&0&004279FDAFFE_C00000000
-Device Description:         JBL Charge 3
-Instance ID:
-BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_VID&00010075_PID&a013\7&b44bb26&0&5CD33D4AA290_C00000000
-Device Description:         Galaxy Buds4 Pro
-";
-
-    #[test]
-    fn picks_the_instance_matching_the_buds_address() {
-        let id = pick_a2dp_instance_id(PNPUTIL, &[0x5CD3_3D4A_A290]).unwrap();
-        assert!(id.ends_with("5CD33D4AA290_C00000000"), "{id}");
-        assert!(id.starts_with(r"BTHENUM\{0000110b"), "{id}");
+    fn args(list: &[&str]) -> Args {
+        parse_args(list.iter().map(|s| s.to_string()))
     }
 
     #[test]
-    fn address_order_decides_and_unknown_addresses_match_nothing() {
-        let id = pick_a2dp_instance_id(PNPUTIL, &[0x1234, 0x0042_79FD_AFFE, 0x5CD3_3D4A_A290]).unwrap();
-        assert!(id.contains("004279FDAFFE"), "{id}");
-        assert_eq!(pick_a2dp_instance_id(PNPUTIL, &[0xDEAD_BEEF]), None);
-        assert_eq!(pick_a2dp_instance_id(PNPUTIL, &[]), None);
-    }
-
-    #[test]
-    fn rejects_ids_that_could_break_cmd_quoting() {
-        let evil = r#"Instance ID: BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_x" & calc &0&5CD33D4AA290_C0"#;
-        assert_eq!(pick_a2dp_instance_id(evil, &[0x5CD3_3D4A_A290]), None);
-    }
-
-    #[test]
-    fn sbc_command_line_is_wrapped_in_outer_quotes() {
-        let cmd = sbc_command_line(r"C:\W\reg.exe", r"C:\W\pnputil.exe", 0, Some(r"BTHENUM\X&0&AB_C0"));
+    fn parses_flags_in_any_style() {
+        assert_eq!(args(&[]), Args::default());
+        assert_eq!(args(&["--tray"]), Args { tray: true, ..Args::default() });
+        assert_eq!(args(&["/Uninstall"]), Args { uninstall: true, ..Args::default() });
         assert_eq!(
-            cmd,
-            r#"/c ""C:\W\reg.exe" add "HKLM\SYSTEM\CurrentControlSet\Services\BthA2dp\Parameters" /v BluetoothAacEnable /t REG_DWORD /d 0 /f && "C:\W\pnputil.exe" /restart-device "BTHENUM\X&0&AB_C0"""#
+            args(&["-install", "--REPLACE", "whatever"]),
+            Args { install: true, replace: true, ..Args::default() }
         );
-        let no_restart = sbc_command_line(r"C:\W\reg.exe", r"C:\W\pnputil.exe", 1, None);
-        assert!(no_restart.starts_with(r#"/c ""C:\W\reg.exe""#));
-        assert!(no_restart.ends_with("/d 1 /f\""));
+        assert_eq!(
+            args(&["--uninstall", "--quiet"]),
+            Args { uninstall: true, quiet: true, ..Args::default() }
+        );
     }
 }
