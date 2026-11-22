@@ -1,6 +1,6 @@
 [package]
 name = "pods4"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Lightweight Windows desktop & tray passthrough and noise controller for Samsung Galaxy Buds4 Pro"
 license = "MIT"
@@ -9,12 +9,14 @@ license = "MIT"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 raw-window-handle = "0.6"
 tray-icon = "0.26"
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_Storage_EnhancedStorage", "Win32_System_WinRT", "Data_Xml_Dom", "UI_Notifications"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
@@ -25,3 +27,6 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+[build-dependencies]
+winresource = "0.1.20"

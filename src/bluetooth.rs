@@ -18,6 +18,7 @@ use windows_sys::Win32::System::LibraryLoader::{
 use crate::protocol::{
     apply_packet, extract_packets, BudsState, PlacementState, SAMSUNG_SPP_GUID,
 };
+use crate::{log_info, log_warn};
 
 /// Lock a mutex, recovering the data if a worker thread panicked while holding it.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -107,7 +108,7 @@ fn ensure_wsa() {
         let mut data: WSADATA = zeroed();
         let rc = WSAStartup(0x0202, &mut data);
         if rc != 0 {
-            eprintln!("WSAStartup failed: {rc}");
+            log_warn!("WSAStartup failed: {rc}");
         }
     });
 }
@@ -332,6 +333,7 @@ impl BudsClient {
             let candidates = rank_candidates(find_paired_devices());
 
             if candidates.is_empty() {
+                log_info!("No paired Galaxy Buds or connected audio devices found");
                 let mut snap = lock(&client.inner.snapshot);
                 snap.connecting = false;
                 guard.disarm();
@@ -371,6 +373,7 @@ impl BudsClient {
                         snap.device_address = Some(dev.address);
                         snap.status_text = format!("Connected to {}", dev.name);
                     }
+                    log_info!("Connected to {} ({:012X})", dev.name, dev.address);
                     client.notify();
 
                     let reader_client = client.clone();
@@ -382,6 +385,8 @@ impl BudsClient {
             if client.inner.shutdown.load(Ordering::SeqCst) {
                 return; // guard clears `connecting`
             }
+            let tried: Vec<&str> = candidates.iter().map(|d| d.name.as_str()).collect();
+            log_warn!("Could not connect; tried {tried:?}");
             let mut snap = lock(&client.inner.snapshot);
             snap.connecting = false;
             guard.disarm();
@@ -504,6 +509,7 @@ impl BudsClient {
         if !owned {
             return;
         }
+        log_info!("Connection dropped; will retry");
         unsafe {
             shutdown(sock, SD_BOTH);
             closesocket(sock);
