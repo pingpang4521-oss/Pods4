@@ -429,6 +429,70 @@ mod tests {
     }
 
     #[test]
+    fn skips_garbage_and_resyncs_after_bad_crc() {
+        let good = set_noise_control(NoiseControlMode::Anc);
+        let mut bad = set_noise_control(NoiseControlMode::Off);
+        let crc_idx = bad.len() - 3;
+        bad[crc_idx] ^= 0xFF;
+
+        let mut buf = vec![0x00, 0x11, 0x22];
+        buf.extend_from_slice(&bad);
+        buf.extend_from_slice(&good);
+
+        let pkts = extract_packets(&mut buf);
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pkts[0].id, msg_id::NOISE_CONTROLS);
+        assert_eq!(pkts[0].payload, vec![NoiseControlMode::Anc as u8]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn keeps_incomplete_trailing_packet() {
+        let full = set_anc_level(3);
+        let mut buf = full[..full.len() - 2].to_vec();
+        assert!(extract_packets(&mut buf).is_empty());
+        assert_eq!(buf.len(), full.len() - 2);
+        buf.extend_from_slice(&full[full.len() - 2..]);
+        assert_eq!(extract_packets(&mut buf).len(), 1);
+    }
+
+    #[test]
+    fn encoders_clamp_out_of_range_values() {
+        assert_eq!(set_ambient_volume(9)[4], 4);
+        assert_eq!(set_anc_level(200)[4], 4);
+        assert_eq!(set_voice_detect_duration(7)[4], 2);
+        assert_eq!(&set_customize_ambient(true, 9, 9, 9)[4..8], &[1, 2, 2, 4]);
+    }
+
+    #[test]
+    fn short_or_unknown_packets_do_not_change_state() {
+        let mut st = BudsState::default();
+        let short_ext = SppPacket { id: msg_id::EXTENDED_STATUS_UPDATED, payload: vec![0; 10] };
+        assert!(!apply_packet(&mut st, &short_ext));
+        let unknown = SppPacket { id: 0x01, payload: vec![1, 2, 3] };
+        assert!(!apply_packet(&mut st, &unknown));
+        let bad_ack = SppPacket { id: msg_id::UNIVERSAL_ACK, payload: vec![0xEE, 1] };
+        assert!(!apply_packet(&mut st, &bad_ack));
+        let bad_mode = SppPacket { id: msg_id::NOISE_CONTROLS_UPDATE, payload: vec![9] };
+        assert!(!apply_packet(&mut st, &bad_mode));
+        assert!(!st.has_initial_sync);
+    }
+
+    #[test]
+    fn status_update_sets_battery_and_charging() {
+        let mut st = BudsState::default();
+        let pkt = SppPacket {
+            id: msg_id::STATUS_UPDATED,
+            payload: vec![0, 80, 70, 0, 0, 0x11, 55, 16],
+        };
+        assert!(apply_packet(&mut st, &pkt));
+        assert_eq!((st.battery_l, st.battery_r, st.battery_case), (80, 70, 55));
+        assert!(st.is_left_charging && !st.is_right_charging);
+        assert_eq!(st.placement_l, PlacementState::Charging);
+        assert_eq!(st.placement_r, PlacementState::Wearing);
+    }
+
+    #[test]
     fn command_encoders_round_trip() {
         let cmds = [
             set_noise_control(NoiseControlMode::Ambient),
