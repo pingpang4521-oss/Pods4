@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use windows_sys::Win32::Networking::WinSock::{
     closesocket, connect, recv, send, setsockopt, shutdown, socket, WSAGetLastError, WSAStartup,
-    INVALID_SOCKET, SD_BOTH, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_RCVTIMEO, WSADATA,
+    INVALID_SOCKET, SD_BOTH, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_RCVTIMEO, SO_SNDTIMEO, WSADATA,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 
@@ -16,6 +16,7 @@ use crate::protocol::{apply_packet, extract_packets, BudsState, SAMSUNG_SPP_GUID
 const AF_BTH: i32 = 32;
 const BTHPROTO_RFCOMM: i32 = 3;
 const WSAETIMEDOUT: i32 = 10060;
+const RECONNECT_DELAYS_S: [u64; 5] = [2, 4, 8, 15, 30];
 
 #[repr(C, packed(1))]
 struct SockAddrBth {
@@ -80,16 +81,16 @@ pub fn find_paired_devices() -> Vec<BtDeviceInfo> {
     let mut devices = Vec::new();
     unsafe {
         // Load bthprops.cpl dynamically so both MSVC and GNU Rust toolchains link cleanly without libbthprops.a
-        let module = LoadLibraryA(b"bthprops.cpl\0".as_ptr());
+        let module = LoadLibraryA(c"bthprops.cpl".as_ptr().cast());
         if module.is_null() {
             return devices;
         }
         let find_first: Option<FnFindFirst> =
-            GetProcAddress(module, b"BluetoothFindFirstDevice\0".as_ptr()).map(|f| std::mem::transmute(f));
+            GetProcAddress(module, c"BluetoothFindFirstDevice".as_ptr().cast()).map(|f| std::mem::transmute(f));
         let find_next: Option<FnFindNext> =
-            GetProcAddress(module, b"BluetoothFindNextDevice\0".as_ptr()).map(|f| std::mem::transmute(f));
+            GetProcAddress(module, c"BluetoothFindNextDevice".as_ptr().cast()).map(|f| std::mem::transmute(f));
         let find_close: Option<FnFindClose> =
-            GetProcAddress(module, b"BluetoothFindDeviceClose\0".as_ptr()).map(|f| std::mem::transmute(f));
+            GetProcAddress(module, c"BluetoothFindDeviceClose".as_ptr().cast()).map(|f| std::mem::transmute(f));
 
         let (Some(find_first), Some(find_next), Some(find_close)) = (find_first, find_next, find_close) else {
             return devices;
@@ -140,6 +141,10 @@ struct Inner {
     stop_flag: Mutex<Option<Arc<AtomicBool>>>,
     snapshot: Mutex<ConnectionSnapshot>,
     on_update: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Set once the app is exiting so background reconnect attempts stop.
+    shutdown: AtomicBool,
+    /// True while an auto_reconnect loop is running, so drops can't stack up loops.
+    reconnecting: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -162,6 +167,8 @@ impl BudsClient {
                     state: BudsState::default(),
                 }),
                 on_update: Mutex::new(None),
+                shutdown: AtomicBool::new(false),
+                reconnecting: AtomicBool::new(false),
             }),
         }
     }
@@ -219,6 +226,11 @@ impl BudsClient {
 
             for dev in &candidates {
                 if let Some(sock) = try_connect_device(dev) {
+                    if client.inner.shutdown.load(Ordering::SeqCst) {
+                        unsafe { closesocket(sock); }
+                        client.inner.snapshot.lock().unwrap().connecting = false;
+                        return;
+                    }
                     let stop = Arc::new(AtomicBool::new(false));
                     *client.inner.socket.lock().unwrap() = sock;
                     *client.inner.stop_flag.lock().unwrap() = Some(stop.clone());
@@ -250,17 +262,19 @@ impl BudsClient {
     pub fn send_async(&self, packet: Vec<u8>) {
         let client = self.clone();
         thread::spawn(move || {
-            let sock = *client.inner.socket.lock().unwrap();
-            if sock == INVALID_SOCKET {
+            // Hold the lock while sending so the socket can't be closed (or its handle reused) mid-send.
+            let guard = client.inner.socket.lock().unwrap();
+            if *guard == INVALID_SOCKET {
                 return;
             }
             unsafe {
-                send(sock, packet.as_ptr(), packet.len() as i32, 0);
+                send(*guard, packet.as_ptr(), packet.len() as i32, 0);
             }
         });
     }
 
     pub fn disconnect(&self) {
+        self.inner.shutdown.store(true, Ordering::SeqCst);
         self.disconnect_internal(true);
     }
 
@@ -322,8 +336,48 @@ impl BudsClient {
         }
 
         if !stop.load(Ordering::SeqCst) {
-            self.disconnect_internal(true);
+            // Close without the generic "Disconnected" status; auto_reconnect sets its own.
+            self.disconnect_internal(false);
+            self.inner.snapshot.lock().unwrap().connected = false;
+            if !self.inner.reconnecting.swap(true, Ordering::SeqCst) {
+                let client = self.clone();
+                thread::spawn(move || {
+                    client.auto_reconnect();
+                    client.inner.reconnecting.store(false, Ordering::SeqCst);
+                });
+            }
         }
+    }
+
+    /// Retries with increasing delays after an unexpected drop (buds put in case, out of range, etc.).
+    fn auto_reconnect(&self) {
+        for delay_s in RECONNECT_DELAYS_S {
+            self.set_status(format!("Connection lost — retrying in {delay_s}s..."));
+            // Sleep in short slices so shutdown or a manual reconnect is noticed promptly.
+            for _ in 0..delay_s * 5 {
+                thread::sleep(Duration::from_millis(200));
+                if self.inner.shutdown.load(Ordering::SeqCst) || self.is_connected() {
+                    return;
+                }
+            }
+            self.connect_auto_async();
+            // Wait for the attempt (ours or one the user started) to finish.
+            while self.snapshot().connecting {
+                if self.inner.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            if self.is_connected() {
+                return;
+            }
+        }
+        self.set_status("Disconnected — click Reconnect".into());
+    }
+
+    fn set_status(&self, text: String) {
+        self.inner.snapshot.lock().unwrap().status_text = text;
+        self.notify();
     }
 }
 
@@ -343,6 +397,14 @@ fn try_connect_device(dev: &BtDeviceInfo) -> Option<SOCKET> {
                 sock,
                 SOL_SOCKET,
                 SO_RCVTIMEO,
+                (&timeout_ms as *const i32).cast(),
+                size_of::<i32>() as i32,
+            );
+            // Bound blocking sends so a stalled link can't hold the socket lock (and block disconnect) forever.
+            setsockopt(
+                sock,
+                SOL_SOCKET,
+                SO_SNDTIMEO,
                 (&timeout_ms as *const i32).cast(),
                 size_of::<i32>() as i32,
             );

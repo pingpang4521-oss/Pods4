@@ -220,8 +220,8 @@ fn read_sbc_forced() -> bool {
     let rc = unsafe {
         RegGetValueA(
             HKEY_LOCAL_MACHINE,
-            b"SYSTEM\\CurrentControlSet\\Services\\BthA2dp\\Parameters\0".as_ptr(),
-            b"BluetoothAacEnable\0".as_ptr(),
+            c"SYSTEM\\CurrentControlSet\\Services\\BthA2dp\\Parameters".as_ptr().cast(),
+            c"BluetoothAacEnable".as_ptr().cast(),
             RRF_RT_REG_DWORD,
             null_mut(),
             (&mut val as *mut u32).cast::<c_void>(),
